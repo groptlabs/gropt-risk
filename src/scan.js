@@ -57,21 +57,25 @@ function pickBestPair(pairs, preferredChainId = "base") {
 function score10({ liquidity, volume24h, fdv, txns24h, priceChange24h }) {
   let s = 0;
 
+  // Liquidity (max 4)
   if (liquidity >= 1_000_000) s += 4;
   else if (liquidity >= 250_000) s += 3;
   else if (liquidity >= 75_000) s += 2;
   else if (liquidity >= 15_000) s += 1;
 
+  // Volume (max 3)
   if (volume24h >= 1_000_000) s += 3;
   else if (volume24h >= 200_000) s += 2;
   else if (volume24h >= 10_000) s += 1;
 
+  // FDV/Liq ratio (max 2)
   if (fdv > 0 && liquidity > 0) {
     const ratio = fdv / liquidity;
     if (ratio <= 25) s += 2;
     else if (ratio <= 80) s += 1;
   }
 
+  // Activity/Momentum (max 1)
   const trades = toNum(txns24h);
   const ch = toNum(priceChange24h);
 
@@ -217,11 +221,9 @@ async function scan(ca, mode = "text") {
       meta: { ...META, generatedAt },
       input,
       reason: "No pairs found on Dexscreener (no liquidity / not indexed).",
-
       risk: { level, score },
       policy,
       label: label(score),
-
       signals: buildSignals({ hasPairs: false }),
       evidence: {},
       links: { dexscreenerTokenUrl: url },
@@ -229,12 +231,14 @@ async function scan(ca, mode = "text") {
 
     if (m === "json") return out;
 
-    const text =
+    // tweet/text/roast all should be usable even if no pairs
+    const linkLine = out.links.dexscreenerTokenUrl ? `\n${out.links.dexscreenerTokenUrl}` : "";
+    const baseText =
       `No pairs found for ${ca}` +
       `\nRisk: ${level} | Policy: ${policy} | Score: ${score}/10 (${out.label})` +
       `\nSignal: NO_PAIRS`;
 
-    return { ...out, textOutput: text };
+    return { ...out, textOutput: `${baseText}${linkLine}` };
   }
 
   // With pair
@@ -263,9 +267,11 @@ async function scan(ca, mode = "text") {
 
   let score = baseScore;
 
+  // Dead tape penalty
   if (trades < 15) score -= 2;
   else if (trades < 50) score -= 1;
 
+  // Overvalued cap (FDV/Liq)
   if (ratio > 120) score = Math.min(score, 6);
   else if (ratio > 60) score = Math.min(score, 7);
 
@@ -302,10 +308,8 @@ async function scan(ca, mode = "text") {
     risk: { level, score },
     policy,
     label: label(score),
-
     evidence,
     signals,
-
     links: {
       dexscreenerPairUrl: chosen?.url || "",
       dexscreenerTokenUrl: url,
@@ -314,14 +318,45 @@ async function scan(ca, mode = "text") {
 
   if (m === "json") return out;
 
-  const line1 = `$${symbol} (${chainId}) - Liq ${fmtUSD(liquidity)} | Vol ${fmtUSD(volume24h)} | FDV ${fmtUSD(fdv)}`;
-  const line2 = `Risk: ${level} | Policy: ${policy} | Score: ${score}/10 (${out.label}) | FDV/Liq: ${ratio ? ratio.toFixed(1) + "x" : "N/A"} | 24h: ${fmtPct(priceChange24h)} | Trades: ${trades}`;
-  const line3 = m === "roast" ? roastLine(level, policy) : `Signals: ${signals.length ? signals.slice(0, 3).map(s => s.id).join(", ") : "none"}`;
+  // tweet mode (bot-ready)
+  if (m === "tweet") {
+    const linkLine = out.links.dexscreenerPairUrl
+      ? `\n${out.links.dexscreenerPairUrl}`
+      : out.links.dexscreenerTokenUrl
+        ? `\n${out.links.dexscreenerTokenUrl}`
+        : "";
+
+    const tweetText = `$${symbol} — GROPT Risk Engine
+
+Score: ${score}/10 (${label(score)})
+Policy: ${policy.toUpperCase()}
+
+FDV/Liq: ${ratio ? ratio.toFixed(1) + "x" : "N/A"}
+24h Trades: ${trades}
+24h Change: ${fmtPct(priceChange24h)}
+
+Every trade should pass GROPT.${linkLine}`;
+
+    return { ...out, textOutput: tweetText };
+  }
+
+  // default text / roast
+  const line1 = `$${symbol} (${chainId}) - Liq ${fmtUSD(liquidity)} | Vol ${fmtUSD(
+    volume24h
+  )} | FDV ${fmtUSD(fdv)}`;
+
+  const line2 = `Risk: ${level} | Policy: ${policy} | Score: ${score}/10 (${out.label}) | FDV/Liq: ${
+    ratio ? ratio.toFixed(1) + "x" : "N/A"
+  } | 24h: ${fmtPct(priceChange24h)} | Trades: ${trades}`;
+
+  const line3 =
+    m === "roast"
+      ? roastLine(level, policy)
+      : `Signals: ${signals.length ? signals.slice(0, 3).map((s) => s.id).join(", ") : "none"}`;
+
   const line4 = out.links.dexscreenerPairUrl || out.links.dexscreenerTokenUrl;
 
   return { ...out, textOutput: `${line1}\n${line2}\n${line3}\n${line4}` };
 }
 
 module.exports = { scan, analyze: scan };
-
-
