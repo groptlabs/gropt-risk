@@ -1,31 +1,27 @@
 # GROPT Risk Engine
 
-> Every trade should pass GROPT.
+GROPT Risk Engine is a pre-trade risk scoring module designed for automated trading systems.
 
-GROPT Risk Engine is a pre-trade risk scoring module designed for claw-compatible trading bots.
+It evaluates a token contract **before execution** and returns a structured decision:
 
-It evaluates token risk before execution and returns a structured policy decision:
-
-- allow
-- caution
-- block
+- `allow`
+- `caution`
+- `block`
 
 ---
 
-# WHAT IT DOES
+## What it does
 
-GROPT analyzes live market data and applies trader-grade risk logic:
+GROPT runs a deterministic risk pipeline and outputs machine-readable JSON:
 
-- Pre-trade risk scoring (1–10)
-- Auto-block on dead pools
-- FDV / Liquidity distortion detection
-- Low activity penalty
-- Structured JSON output
-- Claw-compatible integration
+- Risk score (1–10)
+- Policy decision (`allow | caution | block`)
+- Rule-based signals (why the policy was chosen)
+- Designed to be embedded in bots, routers, and pre-trade hooks
 
 ---
 
-# INSTALLATION
+## Installation
 
 ```bash
 git clone https://github.com/groptlabs/gropt-risk.git
@@ -35,9 +31,9 @@ npm install
 
 ---
 
-# USAGE
+## Usage
 
-Run GROPT risk analysis on a token contract:
+### CLI
 
 ```bash
 node index.js <TOKEN_CA> json
@@ -51,7 +47,7 @@ node index.js 0x1111111111111111111111111111111111111111 json
 
 ---
 
-# OUTPUT EXAMPLE
+## Output (example)
 
 ```json
 {
@@ -72,15 +68,15 @@ node index.js 0x1111111111111111111111111111111111111111 json
 
 ---
 
-# POLICY MEANING
+## Policy meaning
 
-allow → Safe to trade  
-caution → Reduce size / verify  
-block → Do not trade  
+- `allow` → acceptable risk for execution
+- `caution` → reduce size / require manual verification
+- `block` → do not execute
 
 ---
 
-# EXAMPLE PRE-TRADE HOOK (Node)
+## Node integration (pre-trade hook)
 
 ```js
 const { execFileSync } = require("node:child_process");
@@ -89,67 +85,33 @@ function groptRisk(ca) {
   const output = execFileSync("node", ["index.js", ca, "json"], {
     encoding: "utf8",
   });
-
   return JSON.parse(output);
 }
 
 const risk = groptRisk("0xTOKEN");
 
 if (risk.policy === "block") {
-  throw new Error("GROPT BLOCKED TRADE");
+  throw new Error("GROPT blocked execution");
 }
 ```
 
 ---
 
-# HTTP API (LOCAL)
+## Notes
 
-Run the API server:
-
-```bash
-npm run api
-```
-
-Health check:
-
-```bash
-curl http://127.0.0.1:8787/health
-```
-
-Scan a contract:
-
-```bash
-curl -X POST http://127.0.0.1:8787/scan \
--H "Content-Type: application/json" \
--d '{"ca":"0x...","mode":"text"}'
-```
+- This repository contains the **risk module**.  
+- Runtime components (watchers, signal relays, bots) can consume this module via the CLI output.
 
 ---
 
-# WHY GROPT?
+## Roadmap
 
-Most bots trade blindly.
-
-GROPT forces risk discipline before capital deployment.
-
-Built for speed.  
-Designed for automation.  
-Made for serious traders.
+- Stable JSON schema (versioned)
+- Optional HTTP wrapper (local API)
+- Expanded rule set & chain adapters
 
 ---
 
-# ROADMAP
+## Security
 
-- HTTP API version
-- Rate limiting
-- Multi-chain support
-- On-chain signal expansion
-- Token-gated premium tier
-
----
-
-Status: v0.1  
-Module: gropt-risk  
-Maintained by: groptlabs  
-
-Every trade should pass GROPT.
+Never commit `.env` files or API keys.
