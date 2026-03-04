@@ -1,9 +1,3 @@
-﻿node_modules/
-.env
-.env.*
-!.env.example
-*.log
-tmp/
-dist/
-coverage/
-.openclaw/
+﻿.env
+state.json
+node_modules
