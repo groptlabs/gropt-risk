@@ -1,8 +1,20 @@
-﻿const axios = require("axios");
+﻿// src/scan.js
+const axios = require("axios");
+const Web3 = require("web3");
 
 const META = {
   module: "gropt-risk",
-  version: "0.1.0",
+  version: "0.2.0",
+};
+
+// --- FOUR.MEME integration (BSC) ---
+const FOUR = {
+  apiBase: "https://four.meme",
+  tokenGet: (ca) => `https://four.meme/meme-api/v1/private/token/get?address=${ca}`,
+  tokenGetById: (id) => `https://four.meme/meme-api/v1/private/token/getById?id=${id}`,
+
+  // TokenManager2 (V2) on BSC (from docs)
+  tokenManager2: "0x5c952063c7fc8610FFDB798152D69F0B9550762b",
 };
 
 function nowISO() {
@@ -37,7 +49,11 @@ function safeLower(s) {
   return String(s || "").toLowerCase();
 }
 
-function pickBestPair(pairs, preferredChainId = "base") {
+function isHexAddress(a) {
+  return /^0x[a-fA-F0-9]{40}$/.test(String(a || ""));
+}
+
+function pickBestPair(pairs, preferredChainId = "bsc") {
   const chainPairs = pairs.filter(
     (p) => safeLower(p.chainId) === safeLower(preferredChainId)
   );
@@ -198,11 +214,131 @@ function roastLine(level, policy) {
     : "High risk. Wicks will teach you.";
 }
 
+function getBscRpc() {
+  return process.env.BSC_RPC || "https://bsc-dataseed.binance.org/";
+}
+
+async function fetchFourTokenInfo(ca) {
+  try {
+    const { data } = await axios.get(FOUR.tokenGet(ca), { timeout: 8000 });
+    return data?.data || null;
+  } catch {
+    return null;
+  }
+}
+
+function fourSignalsFromTokenInfo(fourInfo) {
+  if (!fourInfo) return [];
+  const out = [];
+
+  // version=V8 => X Mode exclusive (docs)
+  if (String(fourInfo?.version || "").toUpperCase() === "V8") {
+    out.push({
+      id: "FOUR_X_MODE",
+      level: "MEDIUM",
+      title: "Four.meme X Mode token",
+      detail: "Token marked as X Mode (version=V8) by Four.meme.",
+    });
+  }
+
+  // feePlan true => AntiSniperFeeMode (docs)
+  if (fourInfo?.feePlan === true) {
+    out.push({
+      id: "FOUR_ANTI_SNIPER",
+      level: "MEDIUM",
+      title: "AntiSniper fee plan enabled",
+      detail: "Four.meme indicates dynamic fee plan (feePlan=true).",
+    });
+  }
+
+  // taxInfo exists => TaxToken (docs)
+  if (fourInfo?.taxInfo) {
+    out.push({
+      id: "FOUR_TAX_TOKEN",
+      level: "MEDIUM",
+      title: "TaxToken detected",
+      detail: "Four.meme returns taxInfo object for this token.",
+    });
+  }
+
+  return out;
+}
+
+function tokenManager2AbiLite() {
+  return [
+    {
+      inputs: [{ internalType: "address", name: "", type: "address" }],
+      name: "_tokenInfos",
+      outputs: [{ internalType: "uint256", name: "template", type: "uint256" }],
+      stateMutability: "view",
+      type: "function",
+    },
+    {
+      inputs: [{ internalType: "address", name: "", type: "address" }],
+      name: "_tokenInfoEx1s",
+      outputs: [
+        { internalType: "uint256", name: "launchFee", type: "uint256" },
+        { internalType: "uint256", name: "pcFee", type: "uint256" },
+        { internalType: "uint256", name: "feeSetting", type: "uint256" },
+        { internalType: "uint256", name: "blockNumber", type: "uint256" },
+        { internalType: "uint256", name: "extraFee", type: "uint256" },
+      ],
+      stateMutability: "view",
+      type: "function",
+    },
+  ];
+}
+
+async function fetchFourOnchainFlags(ca) {
+  try {
+    const web3 = new Web3(getBscRpc());
+    const tm = new web3.eth.Contract(tokenManager2AbiLite(), FOUR.tokenManager2);
+
+    const tokenInfo = await tm.methods._tokenInfos(ca).call();
+    const template = BigInt(tokenInfo?.template || 0);
+
+    const creatorType = Number((template >> 10n) & 0x3Fn);
+    const isTaxToken = creatorType === 5;
+
+    const ex1 = await tm.methods._tokenInfoEx1s(ca).call();
+    const antiSniper = BigInt(ex1?.feeSetting || 0) > 0n;
+
+    const isXModeExclusive = (template & 0x10000n) > 0n;
+
+    return { ok: true, creatorType, isTaxToken, antiSniper, isXModeExclusive };
+  } catch {
+    return { ok: false };
+  }
+}
+
+// Optional: holders via BscScan (needs API key)
+async function fetchHoldersBscscan(ca) {
+  const key = process.env.BSCSCAN_API_KEY;
+  if (!key) return null;
+
+  try {
+    // Not all tokens expose holders count easily; we do "tokenholdercount" endpoint if available.
+    // If it fails, just return null (no crash).
+    const url =
+      `https://api.bscscan.com/api?module=token&action=tokenholdercount&contractaddress=${ca}&apikey=${key}`;
+    const { data } = await axios.get(url, { timeout: 8000 });
+    const v = data?.result;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    return null;
+  }
+}
+
 async function scan(ca, mode = "text") {
   const m = safeLower(mode);
   const generatedAt = nowISO();
 
-  const input = { chain: "BASE", ca };
+  if (!isHexAddress(ca)) {
+    throw new Error("Input is not a valid 0x address.");
+  }
+
+  const input = { chain: "BSC", ca };
 
   const url = `https://api.dexscreener.com/latest/dex/tokens/${ca}`;
   const { data } = await axios.get(url, { timeout: 8_000 });
@@ -210,11 +346,44 @@ async function scan(ca, mode = "text") {
   const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
   const hasPairs = pairs.length > 0;
 
+  // Enrichment (works with/without Dex pairs)
+  const [fourInfo, fourChain, holders] = await Promise.all([
+    fetchFourTokenInfo(ca),
+    fetchFourOnchainFlags(ca),
+    fetchHoldersBscscan(ca),
+  ]);
+
   // No pairs
   if (!hasPairs) {
     const score = 1;
     const level = riskLevelFromScore(score);
     const policy = policyFromScore(score);
+
+    const fourExtraSignals = fourSignalsFromTokenInfo(fourInfo);
+    if (fourChain?.ok && fourChain.isTaxToken) {
+      fourExtraSignals.push({
+        id: "ONCHAIN_TAX_TOKEN",
+        level: "MEDIUM",
+        title: "TaxToken (on-chain)",
+        detail: "TokenManager2 template indicates creatorType=5 (TaxToken).",
+      });
+    }
+    if (fourChain?.ok && fourChain.antiSniper) {
+      fourExtraSignals.push({
+        id: "ONCHAIN_ANTI_SNIPER",
+        level: "MEDIUM",
+        title: "AntiSniperFeeMode (on-chain)",
+        detail: "TokenManager2 _tokenInfoEx1s.feeSetting > 0.",
+      });
+    }
+    if (fourChain?.ok && fourChain.isXModeExclusive) {
+      fourExtraSignals.push({
+        id: "ONCHAIN_X_MODE",
+        level: "MEDIUM",
+        title: "X Mode exclusive (on-chain)",
+        detail: "TokenManager2 template bit 0x10000 indicates exclusive token.",
+      });
+    }
 
     const out = {
       ok: false,
@@ -224,14 +393,29 @@ async function scan(ca, mode = "text") {
       risk: { level, score },
       policy,
       label: label(score),
-      signals: buildSignals({ hasPairs: false }),
-      evidence: {},
-      links: { dexscreenerTokenUrl: url },
+      signals: [
+        ...buildSignals({ hasPairs: false }),
+        ...fourExtraSignals,
+      ],
+      evidence: {
+        holders: holders ?? null,
+        fourmeme: fourInfo
+          ? {
+              version: fourInfo?.version,
+              feePlan: fourInfo?.feePlan,
+              hasTaxInfo: !!fourInfo?.taxInfo,
+            }
+          : null,
+        fourmemeOnchain: fourChain?.ok ? fourChain : null,
+      },
+      links: {
+        dexscreenerTokenUrl: url,
+        fourTokenApi: FOUR.tokenGet(ca),
+      },
     };
 
     if (m === "json") return out;
 
-    // tweet/text/roast all should be usable even if no pairs
     const linkLine = out.links.dexscreenerTokenUrl ? `\n${out.links.dexscreenerTokenUrl}` : "";
     const baseText =
       `No pairs found for ${ca}` +
@@ -242,13 +426,13 @@ async function scan(ca, mode = "text") {
   }
 
   // With pair
-  const chosen = pickBestPair(pairs, "base");
+  const chosen = pickBestPair(pairs, "bsc");
 
   const symbol = chosen?.baseToken?.symbol || "?";
-  const chainId = (chosen?.chainId || "base").toUpperCase();
+  const chainId = (chosen?.chainId || "bsc").toUpperCase();
 
   const liquidity = toNum(chosen?.liquidity?.usd);
-  const fdv = toNum(chosen?.fdv);
+  const fdv = toNum(chosen?.fdv); // we treat FDV as "mcap proxy" in outputs
   const volume24h = toNum(chosen?.volume?.h24);
 
   const trades =
@@ -280,18 +464,6 @@ async function scan(ca, mode = "text") {
   const level = riskLevelFromScore(score);
   const policy = policyFromScore(score);
 
-  const evidence = {
-    token: symbol,
-    chain: chainId,
-    liquidity_usd: liquidity,
-    volume24h_usd: volume24h,
-    fdv_usd: fdv,
-    trades24h: trades,
-    priceChange24h_pct: priceChange24h,
-    fdv_to_liq: ratio,
-    baseScore,
-  };
-
   const signals = buildSignals({
     liquidity,
     volume24h,
@@ -301,6 +473,61 @@ async function scan(ca, mode = "text") {
     hasPairs: true,
   });
 
+  const fourExtraSignals = fourSignalsFromTokenInfo(fourInfo);
+  if (fourChain?.ok && fourChain.isTaxToken) {
+    fourExtraSignals.push({
+      id: "ONCHAIN_TAX_TOKEN",
+      level: "MEDIUM",
+      title: "TaxToken (on-chain)",
+      detail: "TokenManager2 template indicates creatorType=5 (TaxToken).",
+    });
+  }
+  if (fourChain?.ok && fourChain.antiSniper) {
+    fourExtraSignals.push({
+      id: "ONCHAIN_ANTI_SNIPER",
+      level: "MEDIUM",
+      title: "AntiSniperFeeMode (on-chain)",
+      detail: "TokenManager2 _tokenInfoEx1s.feeSetting > 0.",
+    });
+  }
+  if (fourChain?.ok && fourChain.isXModeExclusive) {
+    fourExtraSignals.push({
+      id: "ONCHAIN_X_MODE",
+      level: "MEDIUM",
+      title: "X Mode exclusive (on-chain)",
+      detail: "TokenManager2 template bit 0x10000 indicates exclusive token.",
+    });
+  }
+
+  // merge (dedupe by id)
+  const mergedSignals = [...signals, ...fourExtraSignals].reduce((acc, s) => {
+    if (!acc.some((x) => x.id === s.id)) acc.push(s);
+    return acc;
+  }, []);
+
+  const evidence = {
+    token: symbol,
+    chain: chainId,
+    liquidity_usd: liquidity,
+    volume24h_usd: volume24h,
+    fdv_usd: fdv, // FDV = marketcap proxy in most memecoins
+    mcap_proxy_usd: fdv,
+    trades24h: trades,
+    priceChange24h_pct: priceChange24h,
+    fdv_to_liq: ratio,
+    baseScore,
+    holders: holders ?? null,
+
+    fourmeme: fourInfo
+      ? {
+          version: fourInfo?.version,
+          feePlan: fourInfo?.feePlan,
+          hasTaxInfo: !!fourInfo?.taxInfo,
+        }
+      : null,
+    fourmemeOnchain: fourChain?.ok ? fourChain : null,
+  };
+
   const out = {
     ok: true,
     meta: { ...META, generatedAt },
@@ -309,10 +536,11 @@ async function scan(ca, mode = "text") {
     policy,
     label: label(score),
     evidence,
-    signals,
+    signals: mergedSignals,
     links: {
       dexscreenerPairUrl: chosen?.url || "",
       dexscreenerTokenUrl: url,
+      fourTokenApi: FOUR.tokenGet(ca),
     },
   };
 
@@ -326,14 +554,25 @@ async function scan(ca, mode = "text") {
         ? `\n${out.links.dexscreenerTokenUrl}`
         : "";
 
-    const tweetText = `$${symbol} — GROPT Risk Engine
+    const holdersLine =
+      typeof holders === "number" ? ` | Holders: ${holders.toLocaleString()}` : "";
 
-Score: ${score}/10 (${label(score)})
-Policy: ${policy.toUpperCase()}
+    const flags = [];
+    if (fourInfo?.feePlan === true || (fourChain?.ok && fourChain.antiSniper)) flags.push("AntiSniper");
+    if (fourInfo?.taxInfo || (fourChain?.ok && fourChain.isTaxToken)) flags.push("TaxToken");
+    if (String(fourInfo?.version || "").toUpperCase() === "V8" || (fourChain?.ok && fourChain.isXModeExclusive))
+      flags.push("X-Mode");
 
-FDV/Liq: ${ratio ? ratio.toFixed(1) + "x" : "N/A"}
-24h Trades: ${trades}
-24h Change: ${fmtPct(priceChange24h)}
+    const flagsLine = flags.length ? `\nFlags: ${flags.join(" • ")}` : "";
+
+    const tweetText = `$${symbol} (${chainId}) — GROPT Risk Engine
+
+CA: ${ca}
+
+MCap: ${fmtUSD(fdv)} | Liq: ${fmtUSD(liquidity)} | Vol(24h): ${fmtUSD(volume24h)}${holdersLine}
+FDV/Liq: ${ratio ? ratio.toFixed(1) + "x" : "N/A"} | Trades(24h): ${trades} | 24h: ${fmtPct(priceChange24h)}
+
+Score: ${score}/10 (${label(score)}) | Policy: ${policy.toUpperCase()}${flagsLine}
 
 Every trade should pass GROPT.${linkLine}`;
 
@@ -341,9 +580,9 @@ Every trade should pass GROPT.${linkLine}`;
   }
 
   // default text / roast
-  const line1 = `$${symbol} (${chainId}) - Liq ${fmtUSD(liquidity)} | Vol ${fmtUSD(
-    volume24h
-  )} | FDV ${fmtUSD(fdv)}`;
+  const line1 = `$${symbol} (${chainId}) - MCap ${fmtUSD(fdv)} | Liq ${fmtUSD(liquidity)} | Vol ${fmtUSD(volume24h)}${
+    typeof holders === "number" ? ` | Holders ${holders.toLocaleString()}` : ""
+  }`;
 
   const line2 = `Risk: ${level} | Policy: ${policy} | Score: ${score}/10 (${out.label}) | FDV/Liq: ${
     ratio ? ratio.toFixed(1) + "x" : "N/A"
@@ -352,7 +591,7 @@ Every trade should pass GROPT.${linkLine}`;
   const line3 =
     m === "roast"
       ? roastLine(level, policy)
-      : `Signals: ${signals.length ? signals.slice(0, 3).map((s) => s.id).join(", ") : "none"}`;
+      : `Signals: ${mergedSignals.length ? mergedSignals.slice(0, 4).map((s) => s.id).join(", ") : "none"}`;
 
   const line4 = out.links.dexscreenerPairUrl || out.links.dexscreenerTokenUrl;
 
