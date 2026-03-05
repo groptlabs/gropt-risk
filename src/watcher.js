@@ -1,4 +1,4 @@
-/* GROPT Watcher (BSC) — FINAL PRO (stable + fresh sniper + BUY/WATCH labels + Smart Money)
+/* GROPT Watcher (BSC) — FINAL PRO (public-safe + stable)
    - candidates: Dexscreener API (search + boosts + profiles) + Binance Meme Rush (optional) + Binance Smart Money (optional)
    - scan filter: MIN_SCORE
    - labels: BUY_SCORE / WATCH_SCORE => 🔥 BUY / 👀 WATCH / ✅ PASS
@@ -7,13 +7,13 @@
    - candidate pool cache + random sampling (prevents same-small-list lock)
    - FRESH SNIPER PREFILTER (before scan): age/liquidity/volume/mcap/progress/socials
    - Telegram output: English, trading-signal style
-   - four.meme enrich: off-chain + on-chain (best-effort)
+   - four.meme enrich: OFF by default (env), best-effort
 */
 
 const axios = require("axios");
 const dotenv = require("dotenv");
 const fs = require("fs");
-const { Web3 } = require("web3");
+const Web3 = require("web3");
 const { scan } = require("./scan");
 
 dotenv.config();
@@ -50,11 +50,15 @@ const ENV = {
   WATCH_SCORE: Number(process.env.WATCH_SCORE || 6),
 
   COOLDOWN_MIN: Number(process.env.COOLDOWN_MIN || 30),
-  SEEN_COOLDOWN_MS: Number(process.env.SEEN_COOLDOWN_MS || Math.max(15000 * 4, 60000)),
+  SEEN_COOLDOWN_MS: Number(
+    process.env.SEEN_COOLDOWN_MS || Math.max(15000 * 4, 60000)
+  ),
 
   DEBUG: cleanEnv(process.env.DEBUG || "") === "1",
 
+  // IMPORTANT: keep consistent with scan.js where possible
   BSC_RPC_URL:
+    cleanEnv(process.env.BSC_RPC) ||
     cleanEnv(process.env.BSC_RPC_URL) ||
     cleanEnv(process.env.RPC_URL) ||
     "https://bsc-dataseed.binance.org/",
@@ -106,7 +110,10 @@ const ENV = {
   STATE_FILE: cleanEnv(process.env.STATE_FILE || "./state.json"),
   STATE_SAVE_EVERY_MS: Number(process.env.STATE_SAVE_EVERY_MS || 5000),
 
-  // Four.meme enrich
+  // ---- Four.meme enrich (PUBLIC SAFE) ----
+  // OFF by default. Enable explicitly in your .env:
+  // FOUR_ENABLED=1
+  FOUR_ENABLED: cleanEnv(process.env.FOUR_ENABLED || "0") === "1",
   FOUR_MEME_API_BASE:
     cleanEnv(process.env.FOUR_MEME_API_BASE) || "https://four.meme/meme-api/v1",
   FOUR_MEME_TOKEN_MANAGER_2:
@@ -265,17 +272,9 @@ function prefilterMeta(meta = {}) {
       : Number(meta.progress);
 
   if (ENV.MODE === "fresh") {
-    if (
-      ENV.PREF_AGE_MIN_SEC > 0 &&
-      ageSec !== null &&
-      ageSec < ENV.PREF_AGE_MIN_SEC
-    )
+    if (ENV.PREF_AGE_MIN_SEC > 0 && ageSec !== null && ageSec < ENV.PREF_AGE_MIN_SEC)
       return false;
-    if (
-      ENV.PREF_AGE_MAX_SEC > 0 &&
-      ageSec !== null &&
-      ageSec > ENV.PREF_AGE_MAX_SEC
-    )
+    if (ENV.PREF_AGE_MAX_SEC > 0 && ageSec !== null && ageSec > ENV.PREF_AGE_MAX_SEC)
       return false;
 
     if (prog !== null && Number.isFinite(prog)) {
@@ -338,6 +337,9 @@ function addToPool(addrsOrObjs, source) {
       if ((!prev.socials || !hasAnySocial(prev.socials)) && incomingMeta?.socials)
         next.socials = incomingMeta.socials;
 
+      // merge nested smart money
+      if (prev?.sm && incomingMeta?.sm) next.sm = { ...prev.sm, ...incomingMeta.sm };
+
       cur.meta = next;
     }
   }
@@ -366,23 +368,19 @@ function sampleFromPool(n) {
   }));
   if (!arr.length) return [];
 
-  // rotate so we don't always start with same
   ROTATE_OFFSET = (ROTATE_OFFSET + ENV.ROTATE_STEP) % arr.length;
   const rotated = arr.slice(ROTATE_OFFSET).concat(arr.slice(0, ROTATE_OFFSET));
 
-  // prefilter + seen
   const filtered = rotated.filter((c) => {
     if (!shouldScan(c.ca)) return false;
     return prefilterMeta(c.meta);
   });
 
-  // PRIORITY: Smart Money first
-  // We don't hard-force; we bias sampling.
+  // Smart money bias first
   filtered.sort((a, b) => {
     const aSm = a.sources?.has("sm") ? 1 : 0;
     const bSm = b.sources?.has("sm") ? 1 : 0;
     if (aSm !== bSm) return bSm - aSm;
-    // then random
     return Math.random() - 0.5;
   });
 
@@ -694,11 +692,7 @@ async function fetchBinanceSmartMoneySignals() {
       const rows = Array.isArray(data?.data) ? data.data : [];
 
       if (ENV.DEBUG) {
-        logDebug("smartMoney resp", {
-          page,
-          code: data?.code,
-          count: rows.length,
-        });
+        logDebug("smartMoney resp", { page, code: data?.code, count: rows.length });
       }
 
       for (const r of rows) {
@@ -718,7 +712,6 @@ async function fetchBinanceSmartMoneySignals() {
           meta: {
             symbol: r?.ticker || null,
             name: r?.ticker || null,
-            // smart money signal meta
             sm: {
               direction: dir || null,
               smartMoneyCount: smCount || 0,
@@ -731,7 +724,6 @@ async function fetchBinanceSmartMoneySignals() {
               launchPlatform: r?.launchPlatform || null,
             },
             marketCapUsd: clampNum(r?.currentMarketCap || r?.alertMarketCap),
-            // liquidity/volume might be missing
             liquidityUsd: 0,
             volumeUsd: 0,
             ageSec: null,
@@ -745,7 +737,6 @@ async function fetchBinanceSmartMoneySignals() {
     }
   }
 
-  // dedup by ca
   const m = new Map();
   for (const r of out) {
     const ca = normAddr(r?.ca);
@@ -754,7 +745,6 @@ async function fetchBinanceSmartMoneySignals() {
     else {
       const prev = m.get(ca);
       const merged = { ...(prev?.meta || {}), ...(r?.meta || {}) };
-      // merge nested sm if needed
       if (prev?.meta?.sm && r?.meta?.sm) merged.sm = { ...prev.meta.sm, ...r.meta.sm };
       m.set(ca, { ca, meta: merged });
     }
@@ -763,10 +753,13 @@ async function fetchBinanceSmartMoneySignals() {
 }
 
 /* -----------------------------
-   Four.meme enrich (best-effort)
+   Four.meme enrich (best-effort, OFF by default)
 ----------------------------- */
 
 async function fourMemeGetToken(address) {
+  if (!ENV.FOUR_ENABLED) return { ok: false, data: null, disabled: true };
+
+  // keep endpoint as-is but gated behind env
   const url = `${ENV.FOUR_MEME_API_BASE}/private/token/get?address=${address}`;
   try {
     const { data } = await axios.get(url, { timeout: 8000 });
@@ -777,68 +770,63 @@ async function fourMemeGetToken(address) {
 }
 
 /* -----------------------------
-   Four.meme on-chain flags
+   Four.meme on-chain flags (correct ABI like scan.js)
 ----------------------------- */
 
-const web3 = new Web3(ENV.BSC_RPC_URL);
-
-function selector(sig) {
-  return web3.utils.sha3(sig).slice(0, 10);
-}
-function pad32(addr) {
-  return addr.toLowerCase().replace(/^0x/, "").padStart(64, "0");
-}
-function wordAt(hexData, index) {
-  const clean = (hexData || "0x").replace(/^0x/, "");
-  const start = index * 64;
-  const chunk = clean.slice(start, start + 64);
-  return chunk.length === 64 ? chunk : null;
-}
-function wordToAddress(word) {
-  if (!word) return null;
-  return "0x" + word.slice(24);
-}
-function wordToUint(word) {
-  if (!word) return null;
-  return BigInt("0x" + word);
-}
-async function ethCall(to, data) {
-  return await web3.eth.call({ to, data });
+function tokenManager2AbiLite() {
+  return [
+    {
+      inputs: [{ internalType: "address", name: "", type: "address" }],
+      name: "_tokenInfos",
+      outputs: [{ internalType: "uint256", name: "template", type: "uint256" }],
+      stateMutability: "view",
+      type: "function",
+    },
+    {
+      inputs: [{ internalType: "address", name: "", type: "address" }],
+      name: "_tokenInfoEx1s",
+      outputs: [
+        { internalType: "uint256", name: "launchFee", type: "uint256" },
+        { internalType: "uint256", name: "pcFee", type: "uint256" },
+        { internalType: "uint256", name: "feeSetting", type: "uint256" },
+        { internalType: "uint256", name: "blockNumber", type: "uint256" },
+        { internalType: "uint256", name: "extraFee", type: "uint256" },
+      ],
+      stateMutability: "view",
+      type: "function",
+    },
+  ];
 }
 
 async function fourMemeOnchainFlags(tokenAddress) {
-  const TM2 = ENV.FOUR_MEME_TOKEN_MANAGER_2;
-
-  let templateAddr = null;
-  let creatorType = null;
-  let feeSetting = null;
+  if (!ENV.FOUR_ENABLED) {
+    return { fourMeme: "N/A", taxToken: "N/A", antiSniper: "N/A" };
+  }
 
   try {
-    const data = selector("_tokenInfos(address)") + pad32(tokenAddress);
-    const ret = await ethCall(TM2, data);
-    templateAddr = wordToAddress(wordAt(ret, 0));
-    const w1 = wordAt(ret, 1);
-    creatorType = w1 ? Number(wordToUint(w1)) : null;
-  } catch {}
+    const web3 = new Web3(ENV.BSC_RPC_URL);
+    const tm = new web3.eth.Contract(tokenManager2AbiLite(), ENV.FOUR_MEME_TOKEN_MANAGER_2);
 
-  try {
-    const data = selector("_tokenInfoEx1s(address)") + pad32(tokenAddress);
-    const ret = await ethCall(TM2, data);
-    const w0 = wordAt(ret, 0);
-    feeSetting = w0 ? wordToUint(w0) : null;
-  } catch {}
+    const tokenInfo = await tm.methods._tokenInfos(tokenAddress).call();
+    const template = BigInt(tokenInfo?.template || 0);
 
-  const isFour =
-    templateAddr &&
-    templateAddr !== "0x0000000000000000000000000000000000000000";
-  const isTaxToken = creatorType === 5;
-  const antiSniperOn = feeSetting !== null && feeSetting > 0n;
+    const creatorType = Number((template >> 10n) & 0x3Fn);
+    const isTaxToken = creatorType === 5;
 
-  return {
-    fourMeme: isFour ? "YES" : "NO",
-    taxToken: isTaxToken ? "YES" : "NO",
-    antiSniper: antiSniperOn ? "ON" : "OFF",
-  };
+    const ex1 = await tm.methods._tokenInfoEx1s(tokenAddress).call();
+    const antiSniperOn = BigInt(ex1?.feeSetting || 0) > 0n;
+
+    // If TokenManager2 has a non-zero template, we treat it as "YES"
+    const isFour = template !== 0n;
+
+    return {
+      fourMeme: isFour ? "YES" : "NO",
+      taxToken: isTaxToken ? "YES" : "NO",
+      antiSniper: antiSniperOn ? "ON" : "OFF",
+    };
+  } catch {
+    return { fourMeme: "UNK", taxToken: "UNK", antiSniper: "UNK" };
+  }
 }
 
 /* -----------------------------
@@ -865,11 +853,22 @@ function fmtSmartMoneyLine(sm) {
   if (sm.direction) parts.push(`DIR=${sm.direction.toUpperCase()}`);
   if (Number(sm.smartMoneyCount || 0) > 0) parts.push(`COUNT=${sm.smartMoneyCount}`);
   if (sm.status) parts.push(`STATUS=${String(sm.status).toUpperCase()}`);
-  if (sm.alertPrice) parts.push(`ALERT=$${Number(sm.alertPrice).toFixed(8)}`.replace(/0+$/,"").replace(/\.$/,""));
-  if (sm.currentPrice) parts.push(`NOW=$${Number(sm.currentPrice).toFixed(8)}`.replace(/0+$/,"").replace(/\.$/,""));
+
+  const fmtPx = (x) => {
+    const n = Number(x);
+    if (!Number.isFinite(n)) return null;
+    return `$${n.toFixed(8)}`.replace(/0+$/,"").replace(/\.$/,"");
+  };
+
+  const ap = fmtPx(sm.alertPrice);
+  const cp = fmtPx(sm.currentPrice);
+
+  if (ap) parts.push(`ALERT=${ap}`);
+  if (cp) parts.push(`NOW=${cp}`);
   if (sm.maxGain) parts.push(`MAXGAIN=${sm.maxGain}%`);
   if (sm.exitRate !== null && sm.exitRate !== undefined) parts.push(`EXIT=${sm.exitRate}%`);
   if (sm.launchPlatform) parts.push(`LP=${sm.launchPlatform}`);
+
   return parts.length ? `🧠 SMART MONEY: ${parts.join(" | ")}` : "🧠 SMART MONEY: n/a";
 }
 
@@ -880,11 +879,9 @@ async function scanAndMaybeSend(candidate) {
 
   if (!isAddress(addr)) return;
 
-  // seen guard
   if (!shouldScan(addr)) return;
   markSeen(addr);
 
-  // dedup send guard
   if (!shouldSend(addr)) {
     logDebug("dedup cooldown skip", addr);
     return;
@@ -895,11 +892,7 @@ async function scanAndMaybeSend(candidate) {
 
   let json;
   try {
-    json = await withTimeout(
-      scan(addr, "json"),
-      ENV.SCAN_TIMEOUT_MS,
-      "scan(json) timeout"
-    );
+    json = await withTimeout(scan(addr, "json"), ENV.SCAN_TIMEOUT_MS, "scan(json) timeout");
   } catch (e) {
     logDebug("scan(json) failed", addr, e.message);
     return;
@@ -910,7 +903,6 @@ async function scanAndMaybeSend(candidate) {
 
   logDebug("scan ok", addr, "score=", score, "policy=", policy);
 
-  // filter: smart money can optionally bypass MIN_SCORE
   if (score < ENV.MIN_SCORE && !(isSM && ENV.BN_SMART_MONEY_FORCE_SEND)) {
     logDebug("filtered: score", addr);
     return;
@@ -918,11 +910,7 @@ async function scanAndMaybeSend(candidate) {
 
   let tweetOut = "";
   try {
-    const t = await withTimeout(
-      scan(addr, "tweet"),
-      ENV.SCAN_TIMEOUT_MS,
-      "scan(tweet) timeout"
-    );
+    const t = await withTimeout(scan(addr, "tweet"), ENV.SCAN_TIMEOUT_MS, "scan(tweet) timeout");
     tweetOut = String(t?.textOutput || "").trim();
   } catch {
     tweetOut = `CA: ${addr}\nScore: ${score}/10\nPolicy: ${policy}`;
@@ -933,7 +921,10 @@ async function scanAndMaybeSend(candidate) {
     fourMemeOnchainFlags(addr),
   ]);
 
-  const fmYesNo = fmOff.ok || onchain.fourMeme === "YES" ? "YES" : "NO";
+  const fmYesNo =
+    ENV.FOUR_ENABLED && (fmOff.ok || onchain.fourMeme === "YES") ? "YES" :
+    ENV.FOUR_ENABLED ? "NO" : "N/A";
+
   const extraLine = `Four.meme: ${fmYesNo} | TaxToken: ${onchain.taxToken} | AntiSniper: ${onchain.antiSniper}`;
 
   const age = fmtAge(meta.ageSec ?? null);
@@ -950,7 +941,6 @@ async function scanAndMaybeSend(candidate) {
 
   const sig = signalLabel(score);
 
-  // English header (Smart Money badge if present)
   const smBadge = isSM ? "🧠 SMART MONEY | " : "";
   const header = `${smBadge}${sig.emoji} ${sig.text} SIGNAL | ${sym} | SRC=${srcTag}`;
   const market = `📊 MCAP: ${mc} | LIQ: ${liq} | VOL24H: ${vol} | AGE: ${age} | PROG: ${prog}`;
@@ -1016,7 +1006,7 @@ async function main() {
   setInterval(saveState, ENV.STATE_SAVE_EVERY_MS).unref();
 
   console.log(
-    `GROPT Watcher started | chain=${ENV.CHAIN} | interval=${ENV.WATCH_INTERVAL_MS}ms | minScore=${ENV.MIN_SCORE} | buyScore=${ENV.BUY_SCORE} | watchScore=${ENV.WATCH_SCORE} | cooldown=${ENV.COOLDOWN_MIN}m | mode=${ENV.MODE} | prefilter=${ENV.PREFILTER_ENABLED ? "ON" : "OFF"} | smartMoney=${ENV.BN_SMART_MONEY_ENABLED ? "ON" : "OFF"}`
+    `GROPT Watcher started | chain=${ENV.CHAIN} | interval=${ENV.WATCH_INTERVAL_MS}ms | minScore=${ENV.MIN_SCORE} | buyScore=${ENV.BUY_SCORE} | watchScore=${ENV.WATCH_SCORE} | cooldown=${ENV.COOLDOWN_MIN}m | mode=${ENV.MODE} | prefilter=${ENV.PREFILTER_ENABLED ? "ON" : "OFF"} | smartMoney=${ENV.BN_SMART_MONEY_ENABLED ? "ON" : "OFF"} | four=${ENV.FOUR_ENABLED ? "ON" : "OFF"}`
   );
 
   while (true) {
