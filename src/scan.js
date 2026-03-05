@@ -1,21 +1,59 @@
-﻿// src/scan.js
+// src/scan.js (CommonJS)
 const axios = require("axios");
 const Web3 = require("web3");
 
 const META = {
   module: "gropt-risk",
-  version: "0.2.0",
+  version: "0.2.1-public",
+};
+
+// -----------------------
+// Config (public-safe)
+// -----------------------
+const CFG = {
+  FOUR_ENABLED: process.env.FOUR_ENABLED === "1",
+  DEX_TIMEOUT_MS: 8000,
+  FOUR_TIMEOUT_MS: 8000,
+  BSCSCAN_TIMEOUT_MS: 8000,
+  FOUR_CACHE_TTL_MS: 60_000, // 1 min cache (anti spam)
+  ONCHAIN_CACHE_TTL_MS: 60_000,
+  DEX_CACHE_TTL_MS: 15_000,
 };
 
 // --- FOUR.MEME integration (BSC) ---
+// NOTE: endpoints include "private" in path; keep feature OFF by default.
 const FOUR = {
   apiBase: "https://four.meme",
   tokenGet: (ca) => `https://four.meme/meme-api/v1/private/token/get?address=${ca}`,
   tokenGetById: (id) => `https://four.meme/meme-api/v1/private/token/getById?id=${id}`,
-
-  // TokenManager2 (V2) on BSC (from docs)
   tokenManager2: "0x5c952063c7fc8610FFDB798152D69F0B9550762b",
 };
+
+// -----------------------
+// Tiny cache (TTL Map)
+// -----------------------
+function makeTtlCache() {
+  const m = new Map(); // key -> { v, exp }
+  return {
+    get(key) {
+      const e = m.get(key);
+      if (!e) return null;
+      if (Date.now() > e.exp) {
+        m.delete(key);
+        return null;
+      }
+      return e.v;
+    },
+    set(key, val, ttlMs) {
+      m.set(key, { v: val, exp: Date.now() + ttlMs });
+    },
+  };
+}
+
+const cacheDex = makeTtlCache();
+const cacheFour = makeTtlCache();
+const cacheOnchain = makeTtlCache();
+const cacheHolders = makeTtlCache();
 
 function nowISO() {
   return new Date().toISOString();
@@ -214,15 +252,50 @@ function roastLine(level, policy) {
     : "High risk. Wicks will teach you.";
 }
 
+// -----------------------
+// RPC handling
+// -----------------------
 function getBscRpc() {
-  return process.env.BSC_RPC || "https://bsc-dataseed.binance.org/";
+  const rpc = String(process.env.BSC_RPC || "").trim();
+  if (!rpc) {
+    // public-safe: fail loudly (don’t silently use a shared public RPC in production)
+    throw new Error("BSC_RPC is missing. Set BSC_RPC in your environment.");
+  }
+  return rpc;
+}
+
+// -----------------------
+// External fetches w/ caching
+// -----------------------
+async function fetchDexscreenerPairs(ca) {
+  const key = `dex:${ca}`;
+  const cached = cacheDex.get(key);
+  if (cached) return cached;
+
+  const url = `https://api.dexscreener.com/latest/dex/tokens/${ca}`;
+  const { data } = await axios.get(url, { timeout: CFG.DEX_TIMEOUT_MS });
+  const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
+
+  const out = { url, pairs };
+  cacheDex.set(key, out, CFG.DEX_CACHE_TTL_MS);
+  return out;
 }
 
 async function fetchFourTokenInfo(ca) {
+  if (!CFG.FOUR_ENABLED) return null;
+
+  const key = `four:${ca}`;
+  const cached = cacheFour.get(key);
+  if (cached) return cached;
+
   try {
-    const { data } = await axios.get(FOUR.tokenGet(ca), { timeout: 8000 });
-    return data?.data || null;
+    const { data } = await axios.get(FOUR.tokenGet(ca), { timeout: CFG.FOUR_TIMEOUT_MS });
+    const out = data?.data || null;
+    cacheFour.set(key, out, CFG.FOUR_CACHE_TTL_MS);
+    return out;
   } catch {
+    // cache negative briefly to avoid hammering
+    cacheFour.set(key, null, 15_000);
     return null;
   }
 }
@@ -231,7 +304,6 @@ function fourSignalsFromTokenInfo(fourInfo) {
   if (!fourInfo) return [];
   const out = [];
 
-  // version=V8 => X Mode exclusive (docs)
   if (String(fourInfo?.version || "").toUpperCase() === "V8") {
     out.push({
       id: "FOUR_X_MODE",
@@ -241,7 +313,6 @@ function fourSignalsFromTokenInfo(fourInfo) {
     });
   }
 
-  // feePlan true => AntiSniperFeeMode (docs)
   if (fourInfo?.feePlan === true) {
     out.push({
       id: "FOUR_ANTI_SNIPER",
@@ -251,7 +322,6 @@ function fourSignalsFromTokenInfo(fourInfo) {
     });
   }
 
-  // taxInfo exists => TaxToken (docs)
   if (fourInfo?.taxInfo) {
     out.push({
       id: "FOUR_TAX_TOKEN",
@@ -290,6 +360,12 @@ function tokenManager2AbiLite() {
 }
 
 async function fetchFourOnchainFlags(ca) {
+  if (!CFG.FOUR_ENABLED) return { ok: false, disabled: true };
+
+  const key = `onchain:${ca}`;
+  const cached = cacheOnchain.get(key);
+  if (cached) return cached;
+
   try {
     const web3 = new Web3(getBscRpc());
     const tm = new web3.eth.Contract(tokenManager2AbiLite(), FOUR.tokenManager2);
@@ -305,31 +381,44 @@ async function fetchFourOnchainFlags(ca) {
 
     const isXModeExclusive = (template & 0x10000n) > 0n;
 
-    return { ok: true, creatorType, isTaxToken, antiSniper, isXModeExclusive };
+    const out = { ok: true, creatorType, isTaxToken, antiSniper, isXModeExclusive };
+    cacheOnchain.set(key, out, CFG.ONCHAIN_CACHE_TTL_MS);
+    return out;
   } catch {
-    return { ok: false };
+    const out = { ok: false };
+    cacheOnchain.set(key, out, 15_000);
+    return out;
   }
 }
 
-// Optional: holders via BscScan (needs API key)
+// Optional: holders via BscScan
 async function fetchHoldersBscscan(ca) {
   const key = process.env.BSCSCAN_API_KEY;
   if (!key) return null;
 
+  const ck = `holders:${ca}`;
+  const cached = cacheHolders.get(ck);
+  if (cached !== null) return cached; // could be number or null
+
   try {
-    // Not all tokens expose holders count easily; we do "tokenholdercount" endpoint if available.
-    // If it fails, just return null (no crash).
     const url =
       `https://api.bscscan.com/api?module=token&action=tokenholdercount&contractaddress=${ca}&apikey=${key}`;
-    const { data } = await axios.get(url, { timeout: 8000 });
+    const { data } = await axios.get(url, { timeout: CFG.BSCSCAN_TIMEOUT_MS });
     const v = data?.result;
     const n = Number(v);
-    return Number.isFinite(n) ? n : null;
+    const out = Number.isFinite(n) ? n : null;
+
+    cacheHolders.set(ck, out, 60_000);
+    return out;
   } catch {
+    cacheHolders.set(ck, null, 30_000);
     return null;
   }
 }
 
+// -----------------------
+// MAIN scan
+// -----------------------
 async function scan(ca, mode = "text") {
   const m = safeLower(mode);
   const generatedAt = nowISO();
@@ -340,26 +429,21 @@ async function scan(ca, mode = "text") {
 
   const input = { chain: "BSC", ca };
 
-  const url = `https://api.dexscreener.com/latest/dex/tokens/${ca}`;
-  const { data } = await axios.get(url, { timeout: 8_000 });
-
-  const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
+  const { url, pairs } = await fetchDexscreenerPairs(ca);
   const hasPairs = pairs.length > 0;
 
-  // Enrichment (works with/without Dex pairs)
+  // Enrichment (parallel)
   const [fourInfo, fourChain, holders] = await Promise.all([
     fetchFourTokenInfo(ca),
     fetchFourOnchainFlags(ca),
     fetchHoldersBscscan(ca),
   ]);
 
-  // No pairs
-  if (!hasPairs) {
-    const score = 1;
-    const level = riskLevelFromScore(score);
-    const policy = policyFromScore(score);
-
+  // Helper: gather Four onchain signals
+  function buildFourOnchainSignals() {
+    const s = [];
     const fourExtraSignals = fourSignalsFromTokenInfo(fourInfo);
+
     if (fourChain?.ok && fourChain.isTaxToken) {
       fourExtraSignals.push({
         id: "ONCHAIN_TAX_TOKEN",
@@ -385,6 +469,21 @@ async function scan(ca, mode = "text") {
       });
     }
 
+    // dedupe by id
+    return fourExtraSignals.reduce((acc, x) => {
+      if (!acc.some((y) => y.id === x.id)) acc.push(x);
+      return acc;
+    }, s);
+  }
+
+  // No pairs
+  if (!hasPairs) {
+    const score = 1;
+    const level = riskLevelFromScore(score);
+    const policy = policyFromScore(score);
+
+    const fourSignals = buildFourOnchainSignals();
+
     const out = {
       ok: false,
       meta: { ...META, generatedAt },
@@ -395,22 +494,19 @@ async function scan(ca, mode = "text") {
       label: label(score),
       signals: [
         ...buildSignals({ hasPairs: false }),
-        ...fourExtraSignals,
+        ...fourSignals,
       ],
       evidence: {
         holders: holders ?? null,
+        four_enabled: CFG.FOUR_ENABLED,
         fourmeme: fourInfo
-          ? {
-              version: fourInfo?.version,
-              feePlan: fourInfo?.feePlan,
-              hasTaxInfo: !!fourInfo?.taxInfo,
-            }
+          ? { version: fourInfo?.version, feePlan: fourInfo?.feePlan, hasTaxInfo: !!fourInfo?.taxInfo }
           : null,
         fourmemeOnchain: fourChain?.ok ? fourChain : null,
       },
       links: {
         dexscreenerTokenUrl: url,
-        fourTokenApi: FOUR.tokenGet(ca),
+        fourTokenApi: CFG.FOUR_ENABLED ? FOUR.tokenGet(ca) : null,
       },
     };
 
@@ -432,12 +528,10 @@ async function scan(ca, mode = "text") {
   const chainId = (chosen?.chainId || "bsc").toUpperCase();
 
   const liquidity = toNum(chosen?.liquidity?.usd);
-  const fdv = toNum(chosen?.fdv); // we treat FDV as "mcap proxy" in outputs
+  const fdv = toNum(chosen?.fdv);
   const volume24h = toNum(chosen?.volume?.h24);
 
-  const trades =
-    toNum(chosen?.txns?.h24?.buys) + toNum(chosen?.txns?.h24?.sells);
-
+  const trades = toNum(chosen?.txns?.h24?.buys) + toNum(chosen?.txns?.h24?.sells);
   const priceChange24h = toNum(chosen?.priceChange?.h24);
   const ratio = fdv > 0 && liquidity > 0 ? fdv / liquidity : 0;
 
@@ -451,11 +545,9 @@ async function scan(ca, mode = "text") {
 
   let score = baseScore;
 
-  // Dead tape penalty
   if (trades < 15) score -= 2;
   else if (trades < 50) score -= 1;
 
-  // Overvalued cap (FDV/Liq)
   if (ratio > 120) score = Math.min(score, 6);
   else if (ratio > 60) score = Math.min(score, 7);
 
@@ -473,34 +565,9 @@ async function scan(ca, mode = "text") {
     hasPairs: true,
   });
 
-  const fourExtraSignals = fourSignalsFromTokenInfo(fourInfo);
-  if (fourChain?.ok && fourChain.isTaxToken) {
-    fourExtraSignals.push({
-      id: "ONCHAIN_TAX_TOKEN",
-      level: "MEDIUM",
-      title: "TaxToken (on-chain)",
-      detail: "TokenManager2 template indicates creatorType=5 (TaxToken).",
-    });
-  }
-  if (fourChain?.ok && fourChain.antiSniper) {
-    fourExtraSignals.push({
-      id: "ONCHAIN_ANTI_SNIPER",
-      level: "MEDIUM",
-      title: "AntiSniperFeeMode (on-chain)",
-      detail: "TokenManager2 _tokenInfoEx1s.feeSetting > 0.",
-    });
-  }
-  if (fourChain?.ok && fourChain.isXModeExclusive) {
-    fourExtraSignals.push({
-      id: "ONCHAIN_X_MODE",
-      level: "MEDIUM",
-      title: "X Mode exclusive (on-chain)",
-      detail: "TokenManager2 template bit 0x10000 indicates exclusive token.",
-    });
-  }
+  const fourSignals = buildFourOnchainSignals();
 
-  // merge (dedupe by id)
-  const mergedSignals = [...signals, ...fourExtraSignals].reduce((acc, s) => {
+  const mergedSignals = [...signals, ...fourSignals].reduce((acc, s) => {
     if (!acc.some((x) => x.id === s.id)) acc.push(s);
     return acc;
   }, []);
@@ -510,7 +577,7 @@ async function scan(ca, mode = "text") {
     chain: chainId,
     liquidity_usd: liquidity,
     volume24h_usd: volume24h,
-    fdv_usd: fdv, // FDV = marketcap proxy in most memecoins
+    fdv_usd: fdv,
     mcap_proxy_usd: fdv,
     trades24h: trades,
     priceChange24h_pct: priceChange24h,
@@ -518,12 +585,9 @@ async function scan(ca, mode = "text") {
     baseScore,
     holders: holders ?? null,
 
+    four_enabled: CFG.FOUR_ENABLED,
     fourmeme: fourInfo
-      ? {
-          version: fourInfo?.version,
-          feePlan: fourInfo?.feePlan,
-          hasTaxInfo: !!fourInfo?.taxInfo,
-        }
+      ? { version: fourInfo?.version, feePlan: fourInfo?.feePlan, hasTaxInfo: !!fourInfo?.taxInfo }
       : null,
     fourmemeOnchain: fourChain?.ok ? fourChain : null,
   };
@@ -540,13 +604,12 @@ async function scan(ca, mode = "text") {
     links: {
       dexscreenerPairUrl: chosen?.url || "",
       dexscreenerTokenUrl: url,
-      fourTokenApi: FOUR.tokenGet(ca),
+      fourTokenApi: CFG.FOUR_ENABLED ? FOUR.tokenGet(ca) : null,
     },
   };
 
   if (m === "json") return out;
 
-  // tweet mode (bot-ready)
   if (m === "tweet") {
     const linkLine = out.links.dexscreenerPairUrl
       ? `\n${out.links.dexscreenerPairUrl}`
@@ -558,11 +621,14 @@ async function scan(ca, mode = "text") {
       typeof holders === "number" ? ` | Holders: ${holders.toLocaleString()}` : "";
 
     const flags = [];
-    if (fourInfo?.feePlan === true || (fourChain?.ok && fourChain.antiSniper)) flags.push("AntiSniper");
-    if (fourInfo?.taxInfo || (fourChain?.ok && fourChain.isTaxToken)) flags.push("TaxToken");
-    if (String(fourInfo?.version || "").toUpperCase() === "V8" || (fourChain?.ok && fourChain.isXModeExclusive))
-      flags.push("X-Mode");
-
+    if (CFG.FOUR_ENABLED) {
+      if (fourInfo?.feePlan === true || (fourChain?.ok && fourChain.antiSniper)) flags.push("AntiSniper");
+      if (fourInfo?.taxInfo || (fourChain?.ok && fourChain.isTaxToken)) flags.push("TaxToken");
+      if (
+        String(fourInfo?.version || "").toUpperCase() === "V8" ||
+        (fourChain?.ok && fourChain.isXModeExclusive)
+      ) flags.push("X-Mode");
+    }
     const flagsLine = flags.length ? `\nFlags: ${flags.join(" • ")}` : "";
 
     const tweetText = `$${symbol} (${chainId}) — GROPT Risk Engine
@@ -579,7 +645,6 @@ Every trade should pass GROPT.${linkLine}`;
     return { ...out, textOutput: tweetText };
   }
 
-  // default text / roast
   const line1 = `$${symbol} (${chainId}) - MCap ${fmtUSD(fdv)} | Liq ${fmtUSD(liquidity)} | Vol ${fmtUSD(volume24h)}${
     typeof holders === "number" ? ` | Holders ${holders.toLocaleString()}` : ""
   }`;
